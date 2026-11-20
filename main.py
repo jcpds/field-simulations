@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass, asdict
 
 import numpy as np
-from PySide6.QtCore import Qt, QPointF, QTimer, Signal
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QBrush, QTransform
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QSlider, QComboBox, QFileDialog, QCheckBox, QFormLayout,
@@ -18,7 +18,11 @@ except ImportError:
     HAS_NUMBA = False
 
 ELECTRIC_SOFTENING = 10.0
-INSULATOR_PERMITTIVITY = 2.0  # Relative to vacuum.
+INSULATOR_PERMITTIVITY = 10.0  # Relative to vacuum.
+SHAPE_KINDS = ('Metal', 'Insulator', 'Superconductor', 'Coil XY', 'Coil Z')
+CONDUCTORS = ('Metal', 'Superconductor')
+MIN_RADIUS = 5
+MAX_RADIUS = 500
 
 
 @dataclass
@@ -33,12 +37,24 @@ class Shape:
     power: float = 1.0
 
 
-def point_in(o, x, y):
+def local_coordinates(o, x, y):
     a = math.radians(o.angle)
-    dx, dy = x-o.x, y-o.y
-    u = dx*math.cos(a)+dy*math.sin(a)
-    v = -dx*math.sin(a)+dy*math.cos(a)
+    dx, dy = x - o.x, y - o.y
+    c, s = math.cos(a), math.sin(a)
+    return dx * c + dy * s, -dx * s + dy * c
+
+
+def point_in(o, x, y):
+    u, v = local_coordinates(o, x, y)
     return (u/o.rx)**2+(v/o.ry)**2 <= 1
+
+
+def selection_handles(o, zoom):
+    return (
+        ('rotate', o.rx + 24 / zoom, 0),
+        ('rx', -max(o.rx, 15 / zoom), 0),
+        ('ry', 0, max(o.ry, 15 / zoom)),
+    )
 
 
 def boundary(o, count=72):
@@ -62,7 +78,7 @@ def touching(a, b):
 
 
 def electric_sources(shapes):
-    metals = [o for o in shapes if o.kind == 'Metal']
+    metals = [o for o in shapes if o.kind in CONDUCTORS]
     if not any(o.charge for o in metals):
         return np.empty((0, 3))
 
@@ -135,6 +151,78 @@ def electric_sources(shapes):
     return np.column_stack((xy, charges))
 
 
+def screening_poles(bodies, poles, axial_coils):
+    """Fit internal equivalent sources to the ideal Meissner boundary."""
+    if not bodies or not (np.any(poles[:, 3]) or np.any(axial_coils[:, 2])):
+        return np.empty((0, 5))
+
+    # Sample 3D ellipsoids so out-of-plane coils also induce screening.
+    # Their depth is taken to be the smaller radius of the drawn slice.
+    count = max(4, min(96, 384 // len(bodies)))
+    i = np.arange(count) + .5
+    z = 1 - 2 * i / count
+    phi = i * math.pi * (3 - math.sqrt(5))
+    # Use reflected pairs so the response respects the canvas midplane.
+    z = z[:count // 2]
+    phi = phi[:len(z)]
+    xy_radius = np.sqrt(1 - z**2)
+    top = np.column_stack((xy_radius * np.cos(phi), xy_radius * np.sin(phi), z))
+    directions = np.concatenate((top, top * [1, 1, -1]))
+    panel_count = len(directions)
+    surfaces, normals, centers, softening = [], [], [], []
+    for body in bodies:
+        angle = math.radians(body.angle)
+        c, s = math.cos(angle), math.sin(angle)
+        rotation = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
+        depth = min(body.rx, body.ry)
+        radii = np.array([body.rx, body.ry, depth])
+        offsets = (directions * radii) @ rotation
+        normal = (directions / radii) @ rotation
+        origin = np.array([body.x, body.y, 0.0])
+        surfaces.extend(origin + offsets)
+        normals.extend(normal / np.linalg.norm(normal, axis=1)[:, None])
+        centers.extend(origin + .65 * offsets)
+        softening.extend([(.04 * depth)**2] * panel_count)
+
+    surfaces = np.asarray(surfaces)
+    normals = np.asarray(normals)
+    centers = np.asarray(centers)
+    softening = np.asarray(softening)
+    incident = np.zeros_like(surfaces)
+    for px, py, pz, strength, softening_squared in poles:
+        delta = surfaces - [px, py, pz]
+        r2 = np.sum(delta**2, axis=1) + softening_squared
+        incident += delta * (strength / r2**1.5)[:, None]
+    # Extend the existing axial-coil approximation off the canvas plane.
+    for cx, cy, power, radius in axial_coils:
+        dx, dy, dz = (surfaces - [cx, cy, 0]).T
+        lateral_squared = dx**2 + dy**2
+        r2 = lateral_squared + dz**2 + (radius * .65)**2
+        scale = power * 650000 / r2**2.5
+        incident[:, 0] += scale * 6 * dz * dx
+        incident[:, 1] += scale * 6 * dz * dy
+        incident[:, 2] += scale * ((radius * .7)**2 - 2 * lateral_squared + 4 * dz**2)
+
+    delta = surfaces[:, None, :] - centers
+    r2 = np.sum(delta**2, axis=2) + softening
+    influence = np.einsum('ijk,ik->ij', delta, normals) / r2**1.5
+    target = -np.einsum('ij,ij->i', incident, normals)
+
+    # Constrain each body's equivalent sources to zero net strength.
+    # Scale the system and damp poorly resolved source modes.
+    influence = influence.reshape(len(surfaces), len(bodies), panel_count)
+    influence -= influence.mean(axis=2, keepdims=True)
+    influence = influence.reshape(len(surfaces), len(centers))
+    scale = max(np.linalg.norm(influence, axis=0).max(), 1e-12)
+    influence /= scale
+    system = influence.T @ influence
+    system.flat[::len(centers) + 1] += .0001
+    strengths = np.linalg.solve(system, influence.T @ target) / scale
+    strengths = strengths.reshape(len(bodies), panel_count)
+    strengths -= strengths.mean(axis=1, keepdims=True)
+    return np.column_stack((centers, strengths.ravel(), softening))
+
+
 def get_sources(shapes):
     charges = electric_sources(shapes)
     # Represent each in-plane coil with two softened pole fields at its ends.
@@ -146,16 +234,19 @@ def get_sources(shapes):
             dx, dy = o.rx * math.cos(angle), o.rx * math.sin(angle)
             strength = o.power * 650000.0 / (2 * o.rx)
             softening_squared = max(3.0, .45 * o.ry)**2
-            poles.extend(((o.x + dx, o.y + dy, strength, softening_squared),
-                          (o.x - dx, o.y - dy, -strength, softening_squared)))
+            poles.extend(((o.x + dx, o.y + dy, 0.0, strength, softening_squared),
+                          (o.x - dx, o.y - dy, 0.0, -strength, softening_squared)))
         elif o.kind == 'Coil Z':
             axial_coils.append((o.x, o.y, o.power, max(o.rx, o.ry)))
-    return (charges, np.array(poles).reshape(-1, 4),
-            np.array(axial_coils).reshape(-1, 4))
+    poles = np.array(poles).reshape(-1, 5)
+    axial_coils = np.array(axial_coils).reshape(-1, 4)
+    bodies = [o for o in shapes if o.kind == 'Superconductor']
+    screening = screening_poles(bodies, poles, axial_coils)
+    return charges, np.concatenate((poles, screening)), axial_coils, bodies
 
 if HAS_NUMBA:
     @njit(parallel=True, cache=True)
-    def field_kernel(xs, ys, charges, poles, axial_coils):
+    def raw_fields(xs, ys, charges, poles, axial_coils):
         E = np.zeros(len(xs))
         B = np.zeros(len(xs))
         for i in prange(len(xs)):
@@ -167,11 +258,12 @@ if HAS_NUMBA:
                 scale = q * 24000 / (r2 * math.sqrt(r2))
                 ex += dx * scale
                 ey += dy * scale
-            for px, py, strength, softening_squared in poles:
+            for px, py, pz, strength, softening_squared in poles:
                 dx, dy = x - px, y - py
-                scale = strength / (dx**2 + dy**2 + softening_squared)**1.5
+                scale = strength / (dx**2 + dy**2 + pz**2 + softening_squared)**1.5
                 bx += dx * scale
                 by += dy * scale
+                bz -= pz * scale
             for cx, cy, power, radius in axial_coils:
                 distance_squared = (x - cx)**2 + (y - cy)**2
                 r2 = distance_squared + (radius * .65)**2
@@ -180,7 +272,7 @@ if HAS_NUMBA:
             B[i] = math.sqrt(bx**2 + by**2 + bz**2)
         return E, B
 else:
-    def field_kernel(xs, ys, charges, poles, axial_coils):
+    def raw_fields(xs, ys, charges, poles, axial_coils):
         ex, ey, bx, by, bz = (np.zeros_like(xs) for _ in range(5))
         for px, py, q in charges:
             dx, dy = xs - px, ys - py
@@ -188,16 +280,24 @@ else:
             scale = q * 24000 / (r2 * np.sqrt(r2))
             ex += dx * scale
             ey += dy * scale
-        for px, py, strength, softening_squared in poles:
+        for px, py, pz, strength, softening_squared in poles:
             dx, dy = xs - px, ys - py
-            scale = strength / (dx**2 + dy**2 + softening_squared)**1.5
+            scale = strength / (dx**2 + dy**2 + pz**2 + softening_squared)**1.5
             bx += dx * scale
             by += dy * scale
+            bz -= pz * scale
         for cx, cy, power, radius in axial_coils:
             distance_squared = (xs - cx)**2 + (ys - cy)**2
             r2 = distance_squared + (radius * .65)**2
             bz += power * 650000 * ((radius * .7)**2 - 2 * distance_squared) / r2**2.5
         return np.hypot(ex, ey), np.sqrt(bx**2 + by**2 + bz**2)
+
+
+def field_kernel(xs, ys, charges, poles, axial_coils, bodies):
+    electric, magnetic = raw_fields(xs, ys, charges, poles, axial_coils)
+    for body in bodies:
+        magnetic[point_in(body, xs, ys)] = 0
+    return electric, magnetic
 
 
 class Canvas(QWidget):
@@ -249,7 +349,8 @@ class Canvas(QWidget):
         p.translate(self.panx,self.pany);p.scale(self.zoom,self.zoom)
         for i,o in enumerate(self.shapes):
             p.save();p.translate(o.x,o.y);p.rotate(o.angle)
-            if o.kind=='Metal':fill='#9ca3af';outline='#e5e7eb'
+            if o.kind == 'Superconductor':fill='#062733';outline='#67e8f9'
+            elif o.kind=='Metal':fill='#9ca3af';outline='#e5e7eb'
             elif o.kind=='Insulator':fill='#f8fafc';outline='#ffffff'
             else:fill='#92400e';outline='#fdba74'
             fill_color = QColor(fill)
@@ -257,7 +358,11 @@ class Canvas(QWidget):
                 fill_color.setAlpha(105)
             p.setPen(QPen(QColor(outline),2/self.zoom));p.setBrush(QBrush(fill_color))
             p.drawEllipse(QPointF(0,0),o.rx,o.ry)
-            if o.kind=='Metal':
+            if o.kind == 'Superconductor':
+                p.setPen(QColor('#cffafe'))
+                label = 'SC+' if o.charge > 0 else 'SC−' if o.charge < 0 else 'SC'
+                p.drawText(-20,-12,40,24,Qt.AlignmentFlag.AlignCenter,label)
+            elif o.kind=='Metal':
                 p.setPen(QColor('#111827'));p.drawText(-12,-12,24,24,Qt.AlignmentFlag.AlignCenter,'+' if o.charge>0 else '−' if o.charge<0 else '0')
             elif o.kind == 'Coil Z':
                 p.setPen(QColor('#ffffff'));p.drawText(-20,-12,40,24,Qt.AlignmentFlag.AlignCenter,'⊙')
@@ -279,11 +384,16 @@ class Canvas(QWidget):
             p.save()
             p.translate(o.x, o.y)
             p.rotate(o.angle)
-            handle = o.rx + 24 / self.zoom
-            p.setPen(QPen(QColor('#facc15'), 2 / self.zoom))
-            p.drawLine(QPointF(o.rx, 0), QPointF(handle, 0))
-            p.setBrush(QBrush(QColor('#facc15')))
-            p.drawEllipse(QPointF(handle, 0), 6 / self.zoom, 6 / self.zoom)
+            size = 6 / self.zoom
+            for action, hx, hy in selection_handles(o, self.zoom):
+                color = QColor('#facc15' if action == 'rotate' else '#67e8f9')
+                p.setPen(QPen(color, 2 / self.zoom))
+                p.setBrush(QBrush(color))
+                if action == 'rotate':
+                    p.drawLine(QPointF(o.rx, 0), QPointF(hx, hy))
+                    p.drawEllipse(QPointF(hx, hy), size, size)
+                else:
+                    p.drawRect(QRectF(hx - size, hy - size, 2 * size, 2 * size))
             p.restore()
         p.end()
     def mousePressEvent(self,event):
@@ -293,13 +403,16 @@ class Canvas(QWidget):
         x,y=self.world(event.position());hit=-1
         if self.mode == 'Select' and self.selected >= 0:
             o = self.shapes[self.selected]
-            angle = math.radians(o.angle)
-            reach = o.rx + 24 / self.zoom
-            hx = o.x + reach * math.cos(angle)
-            hy = o.y + reach * math.sin(angle)
-            if math.hypot(x - hx, y - hy) <= 10 / self.zoom:
-                offset = o.angle - math.degrees(math.atan2(y - o.y, x - o.x))
-                self.drag = ('rotate', offset)
+            u, v = local_coordinates(o, x, y)
+            for action, hx, hy in selection_handles(o, self.zoom):
+                if math.hypot(u - hx, v - hy) > 10 / self.zoom:
+                    continue
+                if action == 'rotate':
+                    offset = o.angle - math.degrees(math.atan2(y - o.y, x - o.x))
+                    self.drag = ('rotate', offset)
+                else:
+                    axis = -u if action == 'rx' else v
+                    self.drag = ('resize', action, axis, getattr(o, action))
                 return
         for i in reversed(range(len(self.shapes))):
             if point_in(self.shapes[i],x,y):hit=i;break
@@ -322,6 +435,13 @@ class Canvas(QWidget):
                     angle = math.degrees(math.atan2(y - o.y, x - o.x)) + self.drag[1]
                     o.angle = (angle + 180) % 360 - 180
                     self.selectionChanged.emit()
+            elif self.drag[0] == 'resize':
+                _, radius, start_axis, start_size = self.drag
+                u, v = local_coordinates(o, x, y)
+                axis = -u if radius == 'rx' else v
+                size = round(start_size + axis - start_axis)
+                setattr(o, radius, max(MIN_RADIUS, min(MAX_RADIUS, size)))
+                self.selectionChanged.emit()
             else:
                 o.x = x - self.drag[1]
                 o.y = y - self.drag[2]
@@ -339,14 +459,14 @@ class MainWindow(QMainWindow):
         self.canvas=Canvas();row.addWidget(self.canvas,1)
         side=QWidget();side.setFixedWidth(285);layout=QVBoxLayout(side);row.addWidget(side)
         layout.addWidget(QLabel('ADD / SELECT OBJECT'))
-        self.mode=QComboBox();self.mode.addItems(['Select','Metal','Insulator','Coil XY','Coil Z']);self.mode.currentTextChanged.connect(self.set_mode);layout.addWidget(self.mode)
-        controls = QLabel('Click to add or select. Drag to move. Drag the yellow handle to rotate.')
+        self.mode=QComboBox();self.mode.addItems(['Select', *SHAPE_KINDS]);self.mode.currentTextChanged.connect(self.set_mode);layout.addWidget(self.mode)
+        controls = QLabel('Drag the object to move, the yellow circle to rotate, or either cyan square to resize.')
         controls.setWordWrap(True)
         layout.addWidget(controls)
         self.group=QGroupBox('Selected object');form=QFormLayout(self.group);layout.addWidget(self.group)
         self.kind_label=QLabel('None');form.addRow('Type',self.kind_label)
         self.rx=QDoubleSpinBox();self.ry=QDoubleSpinBox()
-        for widget in (self.rx,self.ry):widget.setRange(5,500);widget.setDecimals(0)
+        for widget in (self.rx,self.ry):widget.setRange(MIN_RADIUS, MAX_RADIUS);widget.setDecimals(0)
         self.angle=QDoubleSpinBox();self.angle.setRange(-180,180);self.angle.setSuffix('°')
         self.charge=QComboBox();self.charge.addItems(['Negative (−)','Neutral (0)','Positive (+)'])
         self.power=QDoubleSpinBox();self.power.setRange(-10,10);self.power.setSingleStep(.25)
@@ -383,7 +503,7 @@ class MainWindow(QMainWindow):
         self.kind_label.setText(kind)
         for widget,attr in ((self.rx,'rx'),(self.ry,'ry'),(self.angle,'angle'),(self.power,'power')):
             widget.blockSignals(True);widget.setEnabled(bool(o));widget.setValue(getattr(o,attr) if o else 0);widget.blockSignals(False)
-        self.charge.blockSignals(True);self.charge.setEnabled(bool(o and o.kind=='Metal'));self.charge.setCurrentIndex(o.charge+1 if o else 1);self.charge.blockSignals(False)
+        self.charge.blockSignals(True);self.charge.setEnabled(bool(o and o.kind in CONDUCTORS));self.charge.setCurrentIndex(o.charge+1 if o else 1);self.charge.blockSignals(False)
         self.power.setEnabled(bool(o and o.kind.startswith('Coil')))
         if self.canvas.mode=='Select' and self.mode.currentText()!='Select':self.mode.setCurrentText('Select')
     def change(self,attr,value):
@@ -403,11 +523,10 @@ class MainWindow(QMainWindow):
         try:
             with open(path,encoding='utf-8') as f:items=json.load(f)
             if not isinstance(items,list) or len(items)>300:raise ValueError('Expected list of at most 300 objects')
-            allowed={'Metal','Insulator','Coil XY','Coil Z'}
             shapes=[]
             for item in items:
                 o=Shape(**item)
-                if o.kind not in allowed or not (5<=o.rx<=500 and 5<=o.ry<=500) or not all(math.isfinite(v) for v in (o.x,o.y,o.angle,o.power)):raise ValueError('Invalid object parameters')
+                if o.kind not in SHAPE_KINDS or not (MIN_RADIUS <= o.rx <= MAX_RADIUS and MIN_RADIUS <= o.ry <= MAX_RADIUS) or not all(math.isfinite(v) for v in (o.x,o.y,o.angle,o.power)):raise ValueError('Invalid object parameters')
                 shapes.append(o)
             self.canvas.shapes=shapes;self.canvas.selected=-1;self.sync();self.canvas.invalidate()
         except Exception as exc:QMessageBox.warning(self,'Cannot load scene',str(exc))
