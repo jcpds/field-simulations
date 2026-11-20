@@ -19,13 +19,17 @@ Numba is optional; it accelerates field calculations using multicore CPU paralle
 
 - Toolbar: select/move, add metal ellipse, insulator ellipse, in-plane coil, out-of-plane coil.
 - Click blank canvas to add chosen shape. Drag objects to reposition.
-- Click object to edit rotation, size, charge (metal) or coil strength/polarity.
+- Select an object and drag its yellow handle to rotate it. The sidebar also lets you enter a rotation angle, edit size and metal charge, or adjust coil strength and polarity.
 - Mouse wheel zooms about pointer. Middle-drag pans.
 - Save/load scenes as JSON.
-- Green = magnitude of E, red = magnitude of B, yellow = overlap.
+- Green shows electric field magnitude, red shows magnetic field magnitude, and yellow shows overlap. Use the display checkboxes and separate gains to inspect either field. In-plane coils label their north and south ends.
 
 ## Physical limitations (important)
 
-This is a **qualitative, static, 2D approximation**, not a Maxwell solver. Charge is represented by sampled perimeter point charges, with an approximate curvature weighting; overlapping/touching metals are grouped and their assigned charge signs are summed. It does **not** rigorously enforce equipotential boundaries or surface-charge distribution, solve dielectric polarization, accurately model finite solenoid windings, include induction/eddy currents, or predict force/torque. A positive and negative charge placed on touching conductors can cancel in the approximation. B-field intensities are illustrative and are not calibrated to tesla. Colors have independent auto-scaled E/B display gains and cannot be used to infer field energy. Magnetic sources use dipole-like in-plane fields and a simplified out-of-plane field model. No claim of quantitative accuracy.
+This prototype shows qualitative, static electric and magnetic fields in a 2D slice. Fields and display gains use relative units.
+
+The electric model redistributes sampled surface charge so that a metal is approximately equipotential. Each isolated metal or group of touching metals retains its combined assigned charge. A neutral metal develops opposite surface charges near a charged object. Insulators use an approximate bound-charge response with relative permittivity εᵣ = 2 and zero net charge.
+
+In-plane coils use a pair of softened pole fields. Opposite poles facing across a gap reinforce the field there. Like poles oppose each other at the midpoint. The field near the outer ends also changes with spacing, orientation, and polarity. Out-of-plane coils use a simplified axial field model. These static approximations cover electrostatic induction and dielectric polarization. They omit time-dependent induction, eddy currents, forces, and torques.
 
 **Safety:** A simulated field does not validate high-voltage hardware. Avoid high voltage and unfused high-current batteries in initial physical tests.
